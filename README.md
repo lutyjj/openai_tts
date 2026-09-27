@@ -73,6 +73,9 @@ does while an announcement is playing.
 - **Models**: `tts-1`, `tts-1-hd`, `gpt-4o-mini-tts` (with custom speaking-style instructions).
 - **Voices**: full OpenAI catalog including `alloy`, `ash`, `coral`, `echo`, `fable`, `nova`, `onyx`, `sage`, `shimmer`, plus the `gpt-4o-mini-tts`-only voices `ballad`, `cedar`, `marin`, `verse`.
 - **Audio formats**: `mp3`, `opus`, `aac`, `flac`, `wav`, `pcm` per profile.
+  PCM requests use OpenAI's 24 kHz, signed 16-bit little-endian mono layout.
+  FFmpeg encodes that input to MP3 for Home Assistant playback, including during
+  sentence streaming. Other PCM sample rates and channel layouts are not supported.
 - **Streaming playback** with HA 2025.7+ for low first-audio latency. The audio is
   played as it arrives instead of after the whole clip is written. Works with `mp3`,
   `opus`, `aac` and `pcm`; `wav` and `flac` state their length in a header before any
@@ -204,6 +207,19 @@ you write it. [CONTRIBUTING.md](CONTRIBUTING.md) has the details.
 
 If you use a backend that behaves differently from the others, saying so
 in an issue is useful on its own, even without a patch.
+
+### Tests
+
+Use Python 3.14 with `ffmpeg` and `ffprobe` on PATH:
+
+```sh
+python -m pip install -r tests/requirements.txt
+python -m pytest -q
+```
+
+Audio tests exercise the Home Assistant speech manager and decode the output
+with FFmpeg. They cover early audio, sentence joins, normalization, chimes,
+cancellation, and source/encoder failures.
 
 ## Notes
 

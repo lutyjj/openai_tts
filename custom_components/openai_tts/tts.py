@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from contextlib import aclosing
 from datetime import datetime
 from functools import partial
 from typing import Any, AsyncGenerator, AsyncIterable
@@ -74,7 +75,7 @@ from .exceptions import (
     OpenAITTSError,
     OpenAIVoiceDeletedError,
 )
-from .loudness import can_normalize_stream, normalize_stream
+from .loudness import can_normalize_stream, transcode_stream
 from .openaitts_engine import OpenAITTSEngine
 from .repairs import create_voice_deleted_issue
 from .streaming import (
@@ -642,7 +643,7 @@ class OpenAITTSEntity(TextToSpeechEntity, RestoreEntity):
             CONF_INSTRUCTIONS: self._get_config_value(CONF_INSTRUCTIONS),
             CONF_EXTRA_PAYLOAD: self._get_config_value(CONF_EXTRA_PAYLOAD),
             CONF_AUDIO_FORMAT: audio_format,
-            "preferred_format": audio_format,
+            "preferred_format": self._delivery_format(audio_format),
         }
 
     @property
@@ -702,31 +703,34 @@ class OpenAITTSEntity(TextToSpeechEntity, RestoreEntity):
         )
         return int(duration_seconds * 1000)
 
-    def _will_filter_stream(
+    def _will_process_stream(
         self, resolved: dict[str, Any], audio_format: str
     ) -> bool:
-        """Whether a loudness filter goes in front of this stream."""
-        return bool(
+        """Whether playback needs PCM encoding or loudness correction."""
+        return audio_format == "pcm" or bool(
             resolved.get("normalize_audio")
             and can_normalize_stream(audio_format)
         )
 
-    def _apply_loudness(
+    @staticmethod
+    def _delivery_format(audio_format: str) -> str:
+        """Give HA a decodable format, not headerless OpenAI PCM."""
+        return "mp3" if audio_format == "pcm" else audio_format
+
+    def _process_stream(
         self,
         source: AsyncGenerator[bytes, None],
         resolved: dict[str, Any],
         audio_format: str,
     ) -> AsyncGenerator[bytes, None]:
-        """Put the loudness filter in front of a stream when asked to.
-
-        Returns ``source`` untouched when nothing is to be done, so
-        callers can wrap unconditionally.
-        """
-        if not self._will_filter_stream(resolved, audio_format):
+        """Encode PCM for playback and optionally normalize in one pass."""
+        if not self._will_process_stream(resolved, audio_format):
             return source
         ffmpeg_bin, _ = resolve_ffmpeg_paths(self.hass)
-        return normalize_stream(
-            source, audio_format, ffmpeg_bin, LOUDNESS_FILTER
+        return transcode_stream(
+            source, audio_format, ffmpeg_bin,
+            LOUDNESS_FILTER if resolved.get("normalize_audio") else None,
+            output_format=self._delivery_format(audio_format),
         )
 
     def _can_use_streaming(
@@ -867,11 +871,12 @@ class OpenAITTSEntity(TextToSpeechEntity, RestoreEntity):
             source = pipelined_audio_stream(
                 message_gen, _synthesize, audio_format, _spawn, stats
             )
-            async for chunk in self._apply_loudness(
+            async with aclosing(self._process_stream(
                 source, resolved, audio_format
-            ):
-                collected.append(chunk)
-                yield chunk
+            )) as processed:
+                async for chunk in processed:
+                    collected.append(chunk)
+                    yield chunk
         except OpenAITTSError as err:
             # Only the single request run has a message to key the cache
             # on, and it is set before synthesis starts, so it is already
@@ -885,7 +890,7 @@ class OpenAITTSEntity(TextToSpeechEntity, RestoreEntity):
             raise
         except Exception as err:
             # Anything the engine did not raise itself, ffmpeg through
-            # ``_apply_loudness`` most likely. Without this the health
+            # ``_process_stream`` most likely. Without this the health
             # sensor never hears about it.
             self._mark_failed_pipelined(stats, resolved)
             if self._health_tracker is not None:
@@ -996,7 +1001,7 @@ class OpenAITTSEntity(TextToSpeechEntity, RestoreEntity):
     async def _maybe_post_process(
         self, audio_data: bytes, resolved: dict[str, Any]
     ) -> bytes:
-        """Apply chime + normalization, and repair a declared length.
+        """Apply audio effects, repair lengths, and encode PCM for playback.
 
         When there is nothing to apply the engine bytes are returned
         unchanged, and delivery is left to the streaming path or to
@@ -1020,7 +1025,7 @@ class OpenAITTSEntity(TextToSpeechEntity, RestoreEntity):
         requested_format = resolved.get("audio_format", DEFAULT_AUDIO_FORMAT)
         repair_length = requested_format in SELF_DESCRIBING_LENGTH_FORMATS
 
-        if not (chime_enable or normalize_audio or repair_length):
+        if not (chime_enable or normalize_audio or repair_length or requested_format == "pcm"):
             return audio_data
 
         chime_path = None
@@ -1039,8 +1044,11 @@ class OpenAITTSEntity(TextToSpeechEntity, RestoreEntity):
             chime_path=chime_path,
             normalize_audio=normalize_audio,
             input_format=requested_format,
+            output_format=self._delivery_format(requested_format),
         )
         if not processed_audio:
+            if requested_format == "pcm":
+                raise OpenAIInvalidResponseError("PCM encoding returned no audio")
             _LOGGER.warning("Audio processing failed, using original audio")
             return audio_data
         return processed_audio
@@ -1298,7 +1306,7 @@ class OpenAITTSEntity(TextToSpeechEntity, RestoreEntity):
                 resolved["voice"], resolved["model"], pipeline_format,
             )
             return TTSAudioResponse(
-                extension=pipeline_format,
+                extension=self._delivery_format(pipeline_format),
                 data_gen=self._pipelined_stream(
                     request.message_gen, resolved, pipeline_format
                 ),
@@ -1326,7 +1334,7 @@ class OpenAITTSEntity(TextToSpeechEntity, RestoreEntity):
 
         if can_stream:
             return TTSAudioResponse(
-                extension=audio_format,
+                extension=self._delivery_format(audio_format),
                 data_gen=self._validated_stream(
                     full_text, resolved, audio_format
                 ),
@@ -1374,13 +1382,9 @@ class OpenAITTSEntity(TextToSpeechEntity, RestoreEntity):
             self._record_failure(full_text, err, resolved)
             return self._empty_response(audio_format)
 
-        # Post-processing stays in the requested format end to end. The
-        # ``filter_complex`` graph in ``build_ffmpeg_command`` re-samples
-        # both the chime and the TTS input to a common PCM layout before
-        # concat and picks the right encoder for the output. HA still has
-        # its ``preferred_format`` ffmpeg layer as a safety net if the
-        # downstream player needs a different container.
-        delivered_format = audio_format
+        # PCM has no input layout metadata in HA's TTS contract. Deliver
+        # it as MP3, just as on the streaming path; other formats stay native.
+        delivered_format = self._delivery_format(audio_format)
 
         # The audio is finished and valid at this point, so a failure to
         # measure it must not lose it. ffprobe missing or broken is the
@@ -1502,19 +1506,19 @@ class OpenAITTSEntity(TextToSpeechEntity, RestoreEntity):
     async def _validated_stream(
         self, text: str, resolved: dict[str, Any], audio_format: str
     ) -> AsyncGenerator[bytes, None]:
-        """Validated provider stream, loudness-corrected when asked.
+        """Validate, encode PCM, and optionally correct loudness while streaming.
 
         When nothing is put in front of the provider, the inner
         generator does its own bookkeeping and this adds no buffering.
 
-        When the loudness filter is in front, the bookkeeping moves out
+        When a transcoder is in front, the bookkeeping moves out
         here, because the inner generator finishes as soon as the last
         provider byte is read, which is before ffmpeg has produced,
         or failed to produce, anything. Recording success there marked
         the call successful for a clip that never arrived, and left no
         failure sentinel for ``volume_restore`` to find.
         """
-        if not self._will_filter_stream(resolved, audio_format):
+        if not self._will_process_stream(resolved, audio_format):
             # Nothing goes in front, so let the inner generator keep its
             # own bookkeeping and avoid a second copy of the audio.
             async for chunk in self._stream_with_validation(
@@ -1523,7 +1527,7 @@ class OpenAITTSEntity(TextToSpeechEntity, RestoreEntity):
                 yield chunk
             return
 
-        filtered = self._apply_loudness(
+        filtered = self._process_stream(
             self._stream_with_validation(
                 text, resolved, audio_format, record_success=False
             ),
@@ -1532,9 +1536,10 @@ class OpenAITTSEntity(TextToSpeechEntity, RestoreEntity):
         )
         collected: list[bytes] = []
         try:
-            async for chunk in filtered:
-                collected.append(chunk)
-                yield chunk
+            async with aclosing(filtered):
+                async for chunk in filtered:
+                    collected.append(chunk)
+                    yield chunk
         except Exception as err:
             # The filter failed after the provider had already finished,
             # so nothing else has written the sentinel volume_restore

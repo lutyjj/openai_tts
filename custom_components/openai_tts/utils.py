@@ -349,6 +349,7 @@ async def process_audio(
     chime_path: Optional[str] = None,
     normalize_audio: bool = False,
     input_format: Optional[str] = None,
+    output_format: Optional[str] = None,
 ) -> Tuple[str, bytes, float]:
     """
     Process audio content with optional chime and normalization.
@@ -362,6 +363,7 @@ async def process_audio(
         input_format: Explicit format hint (mp3/wav/opus/aac/flac/pcm).
             Required for ``pcm`` since it has no header to auto-detect.
             Falls back to magic-byte detection when omitted.
+        output_format: Delivery format. Defaults to the input format.
 
     Returns:
         Tuple of (format, processed_audio, processing_time_ms). Output is
@@ -377,6 +379,7 @@ async def process_audio(
 
     # Trust the caller's hint when given, fall back to magic-byte detection
     audio_format = input_format or detect_audio_format(audio_content)
+    output_format = output_format or audio_format
     _LOGGER.debug("TTS audio format: %s (hint=%s)", audio_format, input_format)
 
     # The chime path is passed straight through to ffmpeg. The
@@ -403,7 +406,7 @@ async def process_audio(
         # function owns the file it creates and removes it below.
         def create_temp_output() -> str:
             with tempfile.NamedTemporaryFile(
-                suffix=f".{audio_format}", delete=False
+                suffix=f".{output_format}", delete=False
             ) as tmp:
                 return tmp.name
 
@@ -432,7 +435,7 @@ async def process_audio(
                 [actual_chime_path, tts_path],
                 normalize_audio=normalize_audio,
                 tts_input_format=audio_format,
-                output_format=audio_format,
+                output_format=output_format,
                 ffmpeg=ffmpeg,
             )
         elif normalize_audio:
@@ -441,16 +444,16 @@ async def process_audio(
                 [tts_path],
                 normalize_audio=True,
                 tts_input_format=audio_format,
-                output_format=audio_format,
+                output_format=output_format,
                 ffmpeg=ffmpeg,
             )
-        elif audio_format in _REWRITE_HEADER_FORMATS:
+        elif audio_format in _REWRITE_HEADER_FORMATS or output_format != audio_format:
             cmd = build_ffmpeg_command(
                 final_output_path,
                 [tts_path],
                 normalize_audio=False,
                 tts_input_format=audio_format,
-                output_format=audio_format,
+                output_format=output_format,
                 ffmpeg=ffmpeg,
             )
         else:
@@ -471,7 +474,7 @@ async def process_audio(
             # correction, mp3.
             await hass.async_add_executor_job(_remove_quietly, final_output_path)
             total_time = (time.monotonic() - start_time) * 1000
-            return audio_format, final_audio, total_time
+            return output_format, final_audio, total_time
 
         # Run ffmpeg command
         _LOGGER.debug("Executing ffmpeg command: %s", " ".join(cmd))
@@ -512,7 +515,7 @@ async def process_audio(
         await hass.async_add_executor_job(cleanup_files)
 
         total_time = (time.monotonic() - start_time) * 1000
-        return audio_format, final_audio, total_time
+        return output_format, final_audio, total_time
 
     except Exception as e:
         # Best-effort cleanup of any temp files we created during this call.

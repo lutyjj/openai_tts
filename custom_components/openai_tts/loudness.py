@@ -1,4 +1,4 @@
-"""Loudness correction applied to a stream, without buffering it.
+"""Streaming transcoding with optional loudness correction.
 
 The atomic path hands ffmpeg a finished file, so it can use any filter
 it likes. This module exists for the other path, where audio is
@@ -81,13 +81,15 @@ def can_normalize_stream(audio_format: str) -> bool:
     return audio_format in _PIPE_ARGS
 
 
-async def normalize_stream(
+async def transcode_stream(
     source: AsyncIterable[bytes],
     audio_format: str,
     ffmpeg_bin: str,
-    loudness_filter: str,
+    loudness_filter: str | None = None,
+    *,
+    output_format: str | None = None,
 ) -> AsyncGenerator[bytes, None]:
-    """Yield ``source`` with its loudness corrected, still as a stream.
+    """Encode ``source`` without buffering, optionally correcting loudness.
 
     Raises ``ValueError`` for a format that cannot be piped, and
     ``RuntimeError`` when ffmpeg exits non-zero. The caller should treat
@@ -99,16 +101,18 @@ async def normalize_stream(
             f"format {audio_format!r} cannot be filtered on a stream"
         )
 
-    pipe_args = _PIPE_ARGS[audio_format]
-    encoder = AUDIO_FORMAT_ENCODER[audio_format]
+    output_format = output_format or audio_format
+    if output_format not in _PIPE_ARGS:
+        raise ValueError(f"format {output_format!r} cannot be streamed")
+    encoder = AUDIO_FORMAT_ENCODER[output_format]
     proc = await asyncio.create_subprocess_exec(
         ffmpeg_bin, "-hide_banner", "-loglevel", "error",
         *_FAST_START,
-        *pipe_args["read"], "-i", "pipe:0",
-        "-af", loudness_filter,
+        *_PIPE_ARGS[audio_format]["read"], "-i", "pipe:0",
+        *(["-af", loudness_filter] if loudness_filter else []),
         "-ac", "1", "-ar", "24000",
         *encoder["codec_args"],
-        *pipe_args["write"], "pipe:1",
+        *_PIPE_ARGS[output_format]["write"], "-flush_packets", "1", "pipe:1",
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -160,9 +164,9 @@ async def normalize_stream(
             if len(errors) > _STDERR_KEEP_BYTES:
                 del errors[:-_STDERR_KEEP_BYTES]
 
-    feeder = asyncio.create_task(_feed(), name="openai_tts loudness feeder")
+    feeder = asyncio.create_task(_feed(), name="openai_tts audio feeder")
     draining = asyncio.create_task(
-        _drain_errors(), name="openai_tts loudness stderr"
+        _drain_errors(), name="openai_tts audio stderr"
     )
     try:
         while True:
@@ -181,7 +185,7 @@ async def normalize_stream(
         if returncode != 0:
             detail = bytes(errors).decode(errors="replace").strip()
             raise RuntimeError(
-                f"loudness filter failed (exit {returncode}): {detail[-300:]}"
+                f"audio transcoding failed (exit {returncode}): {detail[-300:]}"
             )
     finally:
         # Runs on success, on failure, and when the consumer abandons

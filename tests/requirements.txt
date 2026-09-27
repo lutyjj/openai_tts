@@ -1,0 +1,6 @@
+homeassistant==2026.9.3
+ha-ffmpeg==3.2.2
+mutagen==1.48.1
+sentence-stream==1.3.0
+pytest==9.0.2
+pytest-asyncio==1.3.0
